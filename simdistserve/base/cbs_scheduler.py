@@ -69,6 +69,10 @@ class CBSScheduler(Scheduler):
         self.slo_ttft = slo_ttft
         # Track per-request cooldown (req_id -> earliest next migration time)
         self._cooldown_until: dict = {}
+        # Track initial decode count for role adaptation guard
+        self._initial_n_decode = len(decode_heads)
+        # Track which workers were originally decode (for role switch-back)
+        self._converted_workers: set = set()  # wid of workers converted from decode to prefill
         # Statistics
         self.n_colocated = 0
         self.n_disaggregated = 0
@@ -406,39 +410,54 @@ class CBSScheduler(Scheduler):
     # ---- Role Adaptation (CBS-Full) ----
 
     def _do_role_adaptation(self):
-        """Dynamic role switching: idle decode -> prefill when prefill queue is long."""
-        # Decode -> Prefill: when prefill queue pressure is high and decode worker is empty
-        avg_prefill_queue = sum(
-            len(w.prefill_queue) + w._prefill_ips for w in self._prefill_heads
-        ) / max(len(self._prefill_heads), 1)
+        """Dynamic role switching with conservative guards."""
+        n_decode_now = len(self._decode_heads)
+        n_prefill_now = len(self._prefill_heads)
 
-        # Estimate average prefill queue wait
-        avg_queue_wait = 0
-        for w in self._prefill_heads:
-            avg_queue_wait += self._estimate_prefill_queue_wait(w)
-        avg_queue_wait /= max(len(self._prefill_heads), 1)
+        # Guard: never reduce decode workers below half of initial count
+        min_decode = max(self._initial_n_decode // 2, 1)
 
-        role_thresh = 0.5 * self.slo_ttft
+        # ---- Decode -> Prefill ----
+        # Only when prefill queue pressure is high AND we have enough decode headroom
+        if n_decode_now > min_decode:
+            avg_queue_wait = 0
+            for w in self._prefill_heads:
+                avg_queue_wait += self._estimate_prefill_queue_wait(w)
+            avg_queue_wait /= max(n_prefill_now, 1)
 
-        if avg_queue_wait > role_thresh:
-            # Find an empty decode worker to convert
-            for d_worker in list(self._decode_heads):
-                if len(d_worker.decode_queue) + d_worker._decode_ips > 0:
-                    continue
-                if len(self._decode_heads) <= 1:
-                    break  # Must keep at least 1 decode worker
-                # Switch role: decode -> prefill
-                d_worker.role = 'prefill'
-                d_worker.should_request_stay = False
-                d_worker.global_scheduler = self
-                self._decode_heads.remove(d_worker)
-                self._decode_queues.remove(d_worker.decode_queue)
-                self._prefill_heads.append(d_worker)
-                self._prefill_queues.append(d_worker.prefill_queue)
-                self.n_role_switches += 1
-                break  # One switch per scan
+            role_thresh = 0.5 * self.slo_ttft
 
-        # Prefill -> Decode: when decode pressure is high and prefill worker is idle
+            if avg_queue_wait > role_thresh:
+                # Also check that decode side is healthy before converting
+                avg_tpot = 0
+                n_active = 0
+                for w in self._decode_heads:
+                    if len(w.decode_queue) + w._decode_ips > 0:
+                        avg_tpot += self._estimate_tpot(w)
+                        n_active += 1
+                decode_healthy = (n_active == 0) or (avg_tpot / max(n_active, 1) < 0.5 * self.slo_tpot)
+
+                if decode_healthy:
+                    for d_worker in list(self._decode_heads):
+                        if len(d_worker.decode_queue) + d_worker._decode_ips > 0:
+                            continue
+                        if n_decode_now <= min_decode:
+                            break
+                        # Switch role: decode -> prefill
+                        d_worker.role = 'prefill'
+                        d_worker.should_request_stay = False
+                        d_worker.global_scheduler = self
+                        self._decode_heads.remove(d_worker)
+                        self._decode_queues.remove(d_worker.decode_queue)
+                        self._prefill_heads.append(d_worker)
+                        self._prefill_queues.append(d_worker.prefill_queue)
+                        self._converted_workers.add(d_worker.wid)
+                        self.n_role_switches += 1
+                        n_decode_now -= 1
+                        break  # One switch per scan
+
+        # ---- Prefill -> Decode (switch back) ----
+        # When decode pressure is high, recover converted workers
         avg_tpot = 0
         n_active = 0
         for w in self._decode_heads:
@@ -448,22 +467,22 @@ class CBSScheduler(Scheduler):
         if n_active > 0:
             avg_tpot /= n_active
 
-        if avg_tpot > self.theta_dispatch * self.slo_tpot:
-            # Find an idle prefill worker that was originally a decode worker
+        if avg_tpot > self.theta_dispatch * self.slo_tpot and self._converted_workers:
             for p_worker in list(self._prefill_heads):
-                if p_worker.role != 'prefill':
-                    # This was a converted decode worker
-                    if len(p_worker.prefill_queue) + p_worker._prefill_ips > 0:
-                        continue
-                    if len(self._prefill_heads) <= 1:
-                        break
-                    # Switch back: prefill -> decode
-                    p_worker.role = 'decode'
-                    p_worker.should_request_stay = True
-                    p_worker.global_scheduler = None
-                    self._prefill_heads.remove(p_worker)
-                    self._prefill_queues.remove(p_worker.prefill_queue)
-                    self._decode_heads.append(p_worker)
-                    self._decode_queues.append(p_worker.decode_queue)
-                    self.n_role_switches += 1
+                if p_worker.wid not in self._converted_workers:
+                    continue
+                if len(p_worker.prefill_queue) + p_worker._prefill_ips > 0:
+                    continue
+                if len(self._prefill_heads) <= 1:
                     break
+                # Switch back: prefill -> decode
+                p_worker.role = 'decode'
+                p_worker.should_request_stay = True
+                p_worker.global_scheduler = None
+                self._prefill_heads.remove(p_worker)
+                self._prefill_queues.remove(p_worker.prefill_queue)
+                self._decode_heads.append(p_worker)
+                self._decode_queues.append(p_worker.decode_queue)
+                self._converted_workers.discard(p_worker.wid)
+                self.n_role_switches += 1
+                break

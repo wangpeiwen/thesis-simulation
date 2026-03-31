@@ -47,21 +47,24 @@ class InterferenceModel:
     def _formula_alpha_p(decode_bs: int, prefill_len: int) -> float:
         """
         Parametric model for prefill interference.
-        Prefill is compute-bound, so interference from decode is moderate.
-        Increases with decode batch size (more memory bandwidth contention).
+        Based on empirical observations: alpha_p ranges 0-0.06.
+        Prefill is compute-bound, interference from decode is moderate.
         """
-        # Base: ~5% at decode_bs=10, ~15% at decode_bs=50, ~25% at decode_bs=100
-        return min(0.002 * decode_bs + 0.00005 * prefill_len, 0.4)
+        # ~2% at decode_bs=10, ~5% at decode_bs=50
+        return min(0.001 * decode_bs + 0.000005 * prefill_len, 0.08)
 
     @staticmethod
     def _formula_alpha_d(decode_bs: int, prefill_len: int) -> float:
         """
         Parametric model for decode interference.
-        Decode is memory-bound, so interference from prefill is significant.
-        Increases with prefill length (longer prefill = more compute contention).
+        Based on empirical observations: alpha_d ranges 0-0.09.
+        Decode is memory-bound, interference from prefill is more significant.
+        Key insight: larger decode batch DILUTES interference (shared across more steps).
         """
-        # Base: ~8% at prefill_len=256, ~15% at prefill_len=1024, ~25% at prefill_len=2048
-        return min(0.001 * decode_bs + 0.0001 * prefill_len, 0.5)
+        # Base interference from prefill length, diluted by decode batch size
+        base = 0.00003 * prefill_len  # ~3% at 1024, ~6% at 2048
+        dilution = 1.0 / max(decode_bs, 1)  # Larger batch = less per-request impact
+        return min(base * dilution + 0.0005 * decode_bs, 0.12)
 
     def _lookup(self, model_type: str, decode_bs: int, prefill_len: int, key: str) -> float:
         """
