@@ -61,15 +61,50 @@ def generate_bursty_arrivals(N, base_rate, burst_period=30.0, burst_duration=5.0
     return intervals
 
 
-def generate_workload(N, rate, config, seed=42):
-    """Generate requests and arrival times from config."""
+def generate_workload(N, rate, config, seed=42, duration_s=None):
+    """
+    Generate requests and arrival times from config.
+    If duration_s is set, generate requests for that duration instead of fixed N.
+    This matches real system behavior: requests arrive over a fixed time window.
+    """
     random.seed(seed)
     pmin, pmax = config['prompt_range']
     omin, omax = config['output_range']
-    pairs = [(random.randint(pmin, pmax), random.randint(omin, omax)) for _ in range(N)]
-    requests = convert_pd_pair_to_request(pairs)
 
     arrival_type = config.get('arrival', 'poisson')
+
+    if duration_s is not None:
+        # Generate arrivals until we exceed the time window
+        # This is more realistic: we don't know N in advance
+        np.random.seed(seed)
+        pairs = []
+        intervals = [0]  # first request at t=0
+        t = 0.0
+        while True:
+            if arrival_type == 'bursty':
+                cycle_pos = t % config.get('burst_period', 30.0)
+                cur_rate = rate * config.get('burst_multiplier', 4.0) \
+                    if cycle_pos < config.get('burst_duration', 5.0) else rate
+            else:
+                cur_rate = rate
+            gap = np.random.exponential(1.0 / cur_rate)
+            t += gap
+            if t > duration_s:
+                break
+            intervals.append(gap * 1000)  # ms
+            pairs.append((random.randint(pmin, pmax), random.randint(omin, omax)))
+        # First request
+        if not pairs:
+            pairs.append((random.randint(pmin, pmax), random.randint(omin, omax)))
+        requests = convert_pd_pair_to_request(pairs)
+        actual_n = len(requests)
+        # Trim intervals to match
+        intervals = intervals[:actual_n]
+        return requests, intervals, actual_n
+
+    # Fixed N mode (legacy)
+    pairs = [(random.randint(pmin, pmax), random.randint(omin, omax)) for _ in range(N)]
+    requests = convert_pd_pair_to_request(pairs)
     if arrival_type == 'bursty':
         arrival = generate_bursty_arrivals(
             N, rate,
@@ -80,7 +115,7 @@ def generate_workload(N, rate, config, seed=42):
         )
     else:
         arrival = generate_poisson_arrivals(N, rate, seed=seed)
-    return requests, arrival
+    return requests, arrival, N
 
 
 # ---- Cluster factories ----
@@ -153,31 +188,59 @@ def make_cluster(env, variant, args, model_type, pmt):
 
 def run_one(variant, rate, config, args, model_type, pmt):
     """Run a single experiment, return metrics dict."""
-    requests, arrival = generate_workload(args.N, rate, config, seed=args.seed)
+    duration_s = args.sim_time_limit  # e.g. 600s = 10 min
+
+    # Generate requests that arrive within the time window
+    requests, arrival, actual_n = generate_workload(
+        args.N, rate, config, seed=args.seed, duration_s=duration_s,
+    )
 
     env = simpy.Environment()
     cluster = make_cluster(env, variant, args, model_type, pmt)
     cluster.run()
     put_requests_with_interarrivals(env, cluster.scheduler, arrival, requests)
-    env.run()
 
-    request_df = organize_request_df(requests)
-    request_event_df = organize_request_event_df(requests)
+    # Run for the injection window + a drain phase (2x injection time, capped)
+    drain_time = min(duration_s, 120.0)  # up to 2 min drain
+    sim_limit = (duration_s + drain_time) * 1000  # ms
+    env.run(until=sim_limit)
+
+    # Only count requests that finished
+    finished = [r for r in requests if r._terminated]
+    n_finished = len(finished)
+
+    empty_row = {
+        'workload': config['name'], 'variant': variant, 'rate': rate,
+        'n_gpu': args.n_prefill + args.n_decode,
+        'n_injected': actual_n, 'n_finished': 0,
+        'n_colocated': getattr(cluster.scheduler, 'n_colocated', 0),
+        'n_migrations': getattr(cluster.scheduler, 'n_migrations', 0),
+        'n_role_switches': getattr(cluster.scheduler, 'n_role_switches', 0),
+        'p50_ttft': 0, 'p90_ttft': 0, 'p99_ttft': 0,
+        'p50_tpot': 0, 'p90_tpot': 0, 'p99_tpot': 0,
+        'slo_attainment': 0, 'goodput': 0,
+    }
+    if not finished:
+        return empty_row
+
+    request_df = organize_request_df(finished)
+    request_event_df = organize_request_event_df(finished)
     latency_df = calculate_per_request_latency(request_event_df, request_df.output_lens)
 
     ttft = latency_df['first_token_latency']
     tpot = latency_df['tpot']
     slo_ok = ((ttft <= args.slo_ttft) & (tpot <= args.slo_tpot)).sum()
 
-    # Goodput: SLO-meeting requests per second
-    last_time = max(r.log[-1][0] for r in requests if r.log) / 1000.0  # seconds
-    goodput = slo_ok / last_time if last_time > 0 else 0
+    # Goodput = SLO-meeting requests / total simulation time
+    goodput = slo_ok / duration_s
 
     return {
         'workload': config['name'],
         'variant': variant,
         'rate': rate,
         'n_gpu': args.n_prefill + args.n_decode,
+        'n_injected': actual_n,
+        'n_finished': n_finished,
         'n_colocated': getattr(cluster.scheduler, 'n_colocated', 0),
         'n_migrations': getattr(cluster.scheduler, 'n_migrations', 0),
         'n_role_switches': getattr(cluster.scheduler, 'n_role_switches', 0),
@@ -187,7 +250,7 @@ def run_one(variant, rate, config, args, model_type, pmt):
         'p50_tpot': tpot.quantile(0.5),
         'p90_tpot': tpot.quantile(0.9),
         'p99_tpot': tpot.quantile(0.99),
-        'slo_attainment': slo_ok / args.N * 100,
+        'slo_attainment': slo_ok / n_finished * 100 if n_finished > 0 else 0,
         'goodput': goodput,
     }
 
@@ -209,6 +272,8 @@ def parse_args():
     p.add_argument('--cbs-lambda', type=float, default=0.1)
     p.add_argument('--cbs-kappa', type=float, default=0.1)
     p.add_argument('--kv-latency', type=float, default=5.0)
+    p.add_argument('--sim-time-limit', type=float, default=600.0,
+                   help='Max simulation wall time in seconds (default 600 = 10 min)')
     p.add_argument('--output', default=None)
     return p.parse_args()
 
@@ -262,13 +327,19 @@ def main():
         wl_df = df[df.workload == wl_name]
         if wl_df.empty:
             continue
-        print(f"\n--- {wl_name} ---")
-        summary = wl_df.pivot_table(
-            index='rate', columns='variant',
-            values=['goodput', 'slo_attainment', 'p99_ttft', 'p99_tpot'],
-            aggfunc='first',
-        )
-        print(summary.to_string(float_format='%.1f'))
+        print(f"\n--- {wl_name} (sim_time={args.sim_time_limit}s) ---")
+        for rate in sorted(wl_df.rate.unique()):
+            rdf = wl_df[wl_df.rate == rate]
+            print(f"\n  Rate: {rate} req/s")
+            print(f"  {'Variant':<18s} {'Done':>8s} {'Goodput':>8s} {'SLO%':>6s} {'P99TTFT':>8s} {'P99TPOT':>8s} {'Coloc':>6s} {'Migr':>5s}")
+            print(f"  {'-'*68}")
+            for v in VARIANTS:
+                row = rdf[rdf.variant == v]
+                if row.empty:
+                    continue
+                r = row.iloc[0]
+                done_str = f"{int(r.n_finished)}/{int(r.n_injected)}"
+                print(f"  {v:<18s} {done_str:>8s} {r.goodput:8.1f} {r.slo_attainment:6.1f} {r.p99_ttft:8.0f} {r.p99_tpot:8.0f} {r.n_colocated:6.0f} {r.n_migrations:5.0f}")
     print("=" * 100)
 
     if args.output:
