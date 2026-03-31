@@ -1,0 +1,11 @@
+{
+    "name": "bursty",
+    "description": "突发负载：每30s出现5s的4x流量高峰",
+    "prompt_range": [128, 2048],
+    "output_range": [32, 512],
+    "arrival": "bursty",
+    "burst_period": 30.0,
+    "burst_duration": 5.0,
+    "burst_multiplier": 4.0,
+    "cv": 1.0
+}

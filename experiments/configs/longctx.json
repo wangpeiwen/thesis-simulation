@@ -1,0 +1,8 @@
+{
+    "name": "longctx",
+    "description": "长上下文负载：输入[1024,8192]，输出[64,256]",
+    "prompt_range": [1024, 8192],
+    "output_range": [64, 256],
+    "arrival": "poisson",
+    "cv": 1.0
+}

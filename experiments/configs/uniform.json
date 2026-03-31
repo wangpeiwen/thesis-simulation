@@ -1,0 +1,8 @@
+{
+    "name": "uniform",
+    "description": "均匀负载：泊松到达，输入[128,2048]，输出[32,512]",
+    "prompt_range": [128, 2048],
+    "output_range": [32, 512],
+    "arrival": "poisson",
+    "cv": 1.0
+}
