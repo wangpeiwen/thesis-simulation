@@ -270,7 +270,7 @@ def run_one(variant, rate, config, args, model_type, pmt):
     }
 
 
-def parse_args():
+def parse_args(args_=None):
     p = argparse.ArgumentParser(description='Thesis simulation experiments')
     p.add_argument('--model', default='facebook/opt-13b')
     p.add_argument('--N', type=int, default=500)
@@ -292,7 +292,7 @@ def parse_args():
     p.add_argument('--output', default=None)
     p.add_argument('--verbose', action='store_true', help='Print CBS decisions to terminal')
     p.add_argument('--log-dir', default=None, help='Save event logs to this directory (JSON)')
-    return p.parse_args()
+    return p.parse_args(args=args_)
 
 
 def main():
@@ -333,7 +333,9 @@ def main():
                     row = run_one(variant, rate, config, args, model_type, pmt)
                     results.append(row)
                 except Exception as e:
+                    import traceback
                     print(f"\n  ERROR: {e}")
+                    traceback.print_exc()
 
     print()
     df = pd.DataFrame(results)

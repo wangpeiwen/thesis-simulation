@@ -491,8 +491,9 @@ class CBSScheduler(Scheduler):
         yield self.env.timeout(delay)
         if req in src_worker.decode_queue:
             src_worker.decode_queue.remove(req)
-            dst_worker.decode_queue.append(req)
-            dst_worker.wakeup()
+            if not req._terminated:
+                dst_worker.decode_queue.append(req)
+                dst_worker.wakeup()
 
     def _do_consolidation(self):
         """
@@ -608,6 +609,8 @@ class CBSScheduler(Scheduler):
 
     def _try_convert_to_prefill(self, empty_worker: 'CBSWorker'):
         """Convert a cleared decode worker to prefill if prefill queue pressure is high."""
+        if empty_worker not in self._decode_heads:
+            return  # Already converted by another async path
         n_decode_now = len(self._decode_heads)
         # Guard: |P|≥1 and |D|≥1
         if n_decode_now <= 1:
@@ -630,17 +633,21 @@ class CBSScheduler(Scheduler):
         empty_worker.role = 'prefill'
         empty_worker.should_request_stay = False
         empty_worker.global_scheduler = self
-        self._decode_heads.remove(empty_worker)
-        self._decode_queues.remove(empty_worker.decode_queue)
-        self._prefill_heads.append(empty_worker)
-        self._prefill_queues.append(empty_worker.prefill_queue)
+        if empty_worker in self._decode_heads:
+            self._decode_heads.remove(empty_worker)
+        if empty_worker.decode_queue in self._decode_queues:
+            self._decode_queues.remove(empty_worker.decode_queue)
+        if empty_worker not in self._prefill_heads:
+            self._prefill_heads.append(empty_worker)
+        if empty_worker.prefill_queue not in self._prefill_queues:
+            self._prefill_queues.append(empty_worker.prefill_queue)
         self._converted_workers.add(empty_worker.wid)
         self.n_role_switches += 1
 
     def _delayed_role_check(self, worker, delay):
         """SimPy process: check role conversion after migrations complete."""
         yield self.env.timeout(delay)
-        if len(worker.decode_queue) == 0 and worker._decode_ips == 0 and worker in self._decode_heads:
+        if worker in self._decode_heads and len(worker.decode_queue) == 0 and worker._decode_ips == 0:
             self._try_convert_to_prefill(worker)
 
     def _try_recover_to_decode(self):
@@ -663,6 +670,8 @@ class CBSScheduler(Scheduler):
         for p_worker in list(self._prefill_heads):
             if p_worker.wid not in self._converted_workers:
                 continue
+            if p_worker not in self._prefill_heads:
+                continue  # Already recovered by another path
             if len(p_worker.prefill_queue) + p_worker._prefill_ips > 0:
                 continue
             if len(self._prefill_heads) <= 1:
@@ -674,10 +683,14 @@ class CBSScheduler(Scheduler):
             p_worker.role = 'decode'
             p_worker.should_request_stay = True
             p_worker.global_scheduler = None
-            self._prefill_heads.remove(p_worker)
-            self._prefill_queues.remove(p_worker.prefill_queue)
-            self._decode_heads.append(p_worker)
-            self._decode_queues.append(p_worker.decode_queue)
+            if p_worker in self._prefill_heads:
+                self._prefill_heads.remove(p_worker)
+            if p_worker.prefill_queue in self._prefill_queues:
+                self._prefill_queues.remove(p_worker.prefill_queue)
+            if p_worker not in self._decode_heads:
+                self._decode_heads.append(p_worker)
+            if p_worker.decode_queue not in self._decode_queues:
+                self._decode_queues.append(p_worker.decode_queue)
             self._converted_workers.discard(p_worker.wid)
             self.n_role_switches += 1
             break
