@@ -197,6 +197,11 @@ def run_one(variant, rate, config, args, model_type, pmt):
 
     env = simpy.Environment()
     cluster = make_cluster(env, variant, args, model_type, pmt)
+
+    # Enable verbose logging if requested
+    if hasattr(args, 'verbose') and args.verbose and hasattr(cluster.scheduler, 'verbose'):
+        cluster.scheduler.verbose = True
+
     cluster.run()
     put_requests_with_interarrivals(env, cluster.scheduler, arrival, requests)
 
@@ -233,6 +238,16 @@ def run_one(variant, rate, config, args, model_type, pmt):
 
     # Goodput = SLO-meeting requests / total simulation time
     goodput = slo_ok / duration_s
+
+    # Save event log if log_dir is set
+    event_log = getattr(cluster.scheduler, 'event_log', [])
+    if hasattr(args, 'log_dir') and args.log_dir and event_log:
+        log_dir = Path(args.log_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{config['name']}_{variant}_{rate}.json"
+        import json as _json
+        with open(log_file, 'w') as f:
+            _json.dump(event_log, f, indent=1, default=str)
 
     return {
         'workload': config['name'],
@@ -275,6 +290,8 @@ def parse_args():
     p.add_argument('--sim-time-limit', type=float, default=600.0,
                    help='Max simulation wall time in seconds (default 600 = 10 min)')
     p.add_argument('--output', default=None)
+    p.add_argument('--verbose', action='store_true', help='Print CBS decisions to terminal')
+    p.add_argument('--log-dir', default=None, help='Save event logs to this directory (JSON)')
     return p.parse_args()
 
 

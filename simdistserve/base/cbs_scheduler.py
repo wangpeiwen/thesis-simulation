@@ -87,6 +87,21 @@ class CBSScheduler(Scheduler):
         self.n_disaggregated = 0
         self.n_migrations = 0
         self.n_role_switches = 0
+        # Structured event log for detailed analysis
+        self.event_log: list = []  # list of dicts
+        self.verbose = False  # set True for terminal output
+
+    def _log(self, event_type: str, **kwargs):
+        entry = {'t': self.env.now, 'event': event_type, **kwargs}
+        self.event_log.append(entry)
+        if self.verbose:
+            parts = [f"[{self.env.now:>8.0f}ms] {event_type:>12s}"]
+            for k, v in kwargs.items():
+                if isinstance(v, float):
+                    parts.append(f"{k}={v:.2f}")
+                else:
+                    parts.append(f"{k}={v}")
+            print(" | ".join(parts))
 
     def schedule_new_req(self, req: 'Request'):
         if req.counter >= 0:
@@ -121,8 +136,14 @@ class CBSScheduler(Scheduler):
                 best_worker = d_worker
 
         if best_score > 0 and best_worker is not None:
+            self._log('CBS_COLOC', req_id=req.req_id, score=best_score,
+                      target_wid=best_worker.wid, prefill_len=req.prefill_lens,
+                      output_len=req.output_lens, c_disagg=c_disagg)
             self._route_coloc(req, best_worker)
         else:
+            self._log('CBS_DISAGG', req_id=req.req_id, score=best_score,
+                      prefill_len=req.prefill_lens, output_len=req.output_lens,
+                      c_disagg=c_disagg)
             self._route_disagg(req)
 
     def _route_coloc(self, req: 'Request', d_worker: 'CBSWorker'):
@@ -346,6 +367,8 @@ class CBSScheduler(Scheduler):
                 continue
             # Shared migration budget per scan (chap4: mitigation + consolidation share R_max)
             self._scan_migrations = 0
+            # Log node snapshot before migration scan
+            self._log_node_snapshot()
             self._do_mitigation()
             self._do_consolidation()
             # Switch-back check runs every scan (independent of consolidation)
@@ -366,6 +389,21 @@ class CBSScheduler(Scheduler):
             engine_type=worker.engine_type,
         )
         return t_step
+
+    def _log_node_snapshot(self):
+        """Log state of all decode nodes at each migration scan."""
+        nodes = []
+        for w in self._decode_heads:
+            bs = len(w.decode_queue) + w._decode_ips
+            tpot = self._estimate_tpot(w) if bs > 0 else 0
+            p_viol = self._violation_prob(w)
+            nodes.append({
+                'wid': w.wid, 'role': w.role, 'decode_bs': bs,
+                'prefill_qs': len(w.prefill_queue),
+                'tpot': round(tpot, 1), 'p_viol': round(p_viol, 3),
+            })
+        self._log('NODE_SNAP', n_prefill=len(self._prefill_heads),
+                  n_decode=len(self._decode_heads), nodes=nodes)
 
     def _violation_prob(self, worker: 'CBSWorker') -> float:
         """
@@ -439,6 +477,10 @@ class CBSScheduler(Scheduler):
 
             if best_dst is not None:
                 kv_delay = self.kv_transfer_latency * (req.current_context_len / 512.0)
+                self._log('MIGRATE_MIT', req_id=req.req_id,
+                          src_wid=src_worker.wid, dst_wid=best_dst.wid,
+                          g_mig=best_g_mig, kv_delay=kv_delay, p_viol=p_viol,
+                          ctx_len=req.current_context_len)
                 self.env.process(self._async_migrate(req, src_worker, best_dst, kv_delay))
                 self._cooldown_until[req.req_id] = now + self.migration_cooldown
                 self._scan_migrations += 1
@@ -528,6 +570,9 @@ class CBSScheduler(Scheduler):
                 placements.append((req, best_dst))
 
             if all_placed and placements:
+                self._log('MIGRATE_CON', src_wid=src_worker.wid,
+                          n_reqs=len(placements),
+                          dst_wids=[d.wid for _, d in placements])
                 for req, dst_worker in placements:
                     kv_delay = self.kv_transfer_latency * (req.current_context_len / 512.0)
                     self.env.process(self._async_migrate(req, src_worker, dst_worker, kv_delay))
@@ -578,6 +623,10 @@ class CBSScheduler(Scheduler):
             return
 
         # Convert: decode -> prefill
+        self._log('ROLE_D2P', wid=empty_worker.wid,
+                  prefill_queue_wait=avg_queue_wait,
+                  n_prefill_before=len(self._prefill_heads),
+                  n_decode_before=n_decode_now)
         empty_worker.role = 'prefill'
         empty_worker.should_request_stay = False
         empty_worker.global_scheduler = self
@@ -619,6 +668,9 @@ class CBSScheduler(Scheduler):
             if len(self._prefill_heads) <= 1:
                 break
             # Switch back: prefill -> decode
+            self._log('ROLE_P2D', wid=p_worker.wid, avg_tpot=avg_tpot,
+                      n_prefill_before=len(self._prefill_heads),
+                      n_decode_before=len(self._decode_heads))
             p_worker.role = 'decode'
             p_worker.should_request_stay = True
             p_worker.global_scheduler = None
