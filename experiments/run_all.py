@@ -188,7 +188,49 @@ def make_cluster(env, variant, args, model_type, pmt):
 
 def run_one(variant, rate, config, args, model_type, pmt):
     """Run a single experiment, return metrics dict."""
-    duration_s = args.sim_time_limit  # e.g. 600s = 10 min
+    duration_s = args.sim_time_limit
+
+    # Apply time scaling by patching the module-level functions
+    # Must patch in all modules that import them
+    s = args.time_scale
+    if s != 1.0:
+        import simdistserve.estimators.time_estimator as _te
+        import simdistserve.base.worker as _bw
+        import simdistserve.base.cbs_worker as _cw
+        import simdistserve.base.cbs_scheduler as _cs
+
+        if not hasattr(_te, '_orig_prefill'):
+            _te._orig_prefill = _te.get_prefill_time
+            _te._orig_decode = _te.get_decode_time
+
+        def _sp(*a, **kw): return _te._orig_prefill(*a, **kw) * s  # prefill scaled
+        def _sd(*a, **kw): return _te._orig_decode(*a, **kw)  # decode unchanged
+
+        # Patch everywhere these functions are referenced
+        _te.get_prefill_time = _sp
+        _te.get_decode_time = _sd
+        _bw.get_prefill_time = _sp
+        _bw.get_decode_time = _sd
+        _cw.get_prefill_time = _sp
+        _cw.get_decode_time = _sd
+        _cs.get_prefill_time = _sp
+        _cs.get_decode_time = _sd
+
+    try:
+        return _run_one_inner(variant, rate, config, args, model_type, pmt, duration_s)
+    finally:
+        if s != 1.0:
+            _te.get_prefill_time = _te._orig_prefill
+            _te.get_decode_time = _te._orig_decode
+            _bw.get_prefill_time = _te._orig_prefill
+            _bw.get_decode_time = _te._orig_decode
+            _cw.get_prefill_time = _te._orig_prefill
+            _cw.get_decode_time = _te._orig_decode
+            _cs.get_prefill_time = _te._orig_prefill
+            _cs.get_decode_time = _te._orig_decode
+
+
+def _run_one_inner(variant, rate, config, args, model_type, pmt, duration_s):  # e.g. 600s = 10 min
 
     # Generate requests that arrive within the time window
     requests, arrival, actual_n = generate_workload(
@@ -287,6 +329,8 @@ def parse_args(args_=None):
     p.add_argument('--cbs-lambda', type=float, default=0.1)
     p.add_argument('--cbs-kappa', type=float, default=0.1)
     p.add_argument('--kv-latency', type=float, default=5.0)
+    p.add_argument('--time-scale', type=float, default=1.0,
+                   help='Scale factor for prefill time only (simulate prefill-bottlenecked models)')
     p.add_argument('--sim-time-limit', type=float, default=600.0,
                    help='Max simulation wall time in seconds (default 600 = 10 min)')
     p.add_argument('--output', default=None)
