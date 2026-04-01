@@ -12,6 +12,7 @@ Supports three variants:
   - CBS-NoRole: routing + bidirectional migration, no role adaptation
   - CBS-Full: routing + migration + role adaptation
 """
+import math
 from typing import List, TYPE_CHECKING
 
 from simdistserve.base.scheduler import Scheduler
@@ -39,7 +40,7 @@ class CBSScheduler(Scheduler):
         # Migration parameters
         enable_migration: bool = False,
         enable_role_adaptation: bool = False,
-        migration_interval: float = 500.0,
+        migration_interval: float = 1000.0,  # 1s scan period (chap4 sec 4.5.3)
         theta_ceil: float = 0.3,
         theta_floor: float = 0.4,
         theta_dispatch: float = 0.85,
@@ -47,6 +48,11 @@ class CBSScheduler(Scheduler):
         migration_cooldown: float = 10000.0,
         slo_tpot: float = 100.0,
         slo_ttft: float = 2000.0,
+        # Memory / compute budget constraints
+        rho_min: float = 0.05,
+        max_gpu_mem_tokens: int = 66144,  # from profile data max_num_tokens
+        # P_viol normal approximation
+        sigma_alpha: float = 0.02,
     ):
         super().__init__(env, prefill_heads, decode_heads)
         self.cluster = cluster
@@ -67,6 +73,9 @@ class CBSScheduler(Scheduler):
         self.migration_cooldown = migration_cooldown
         self.slo_tpot = slo_tpot
         self.slo_ttft = slo_ttft
+        self.rho_min = rho_min
+        self.max_gpu_mem_tokens = max_gpu_mem_tokens
+        self.sigma_alpha = sigma_alpha
         # Track per-request cooldown (req_id -> earliest next migration time)
         self._cooldown_until: dict = {}
         # Track initial decode count for role adaptation guard
@@ -88,6 +97,22 @@ class CBSScheduler(Scheduler):
         best_score = float('-inf')
         best_worker = None
         for d_worker in self._decode_heads:
+            # I_mem: memory feasibility check (chap4 eq 4.15)
+            tokens_used = sum(r.current_context_len for r in d_worker.decode_queue)
+            tokens_after = tokens_used + req.prefill_lens + req.output_lens
+            if tokens_after > self.max_gpu_mem_tokens * (1 - self.rho_min):
+                continue
+
+            # B_token_max: compute budget check (chap4 eq 4.9)
+            iter_tokens = sum(1 for _ in d_worker.decode_queue) + req.prefill_lens
+            decode_bs = len(d_worker.decode_queue) + d_worker._decode_ips
+            if decode_bs > 0 and self.slo_tpot > 0:
+                t_iter_0 = self._estimate_tpot(d_worker)
+                marginal = t_iter_0 / max(decode_bs, 1)
+                b_token_max = self.slo_tpot / max(marginal, 0.001) if marginal > 0 else float('inf')
+                if iter_tokens > b_token_max:
+                    continue
+
             c_coloc = self._compute_coloc_cost(req, d_worker)
             risk = self._compute_risk(req, d_worker)
             score = c_disagg - c_coloc - self.mu * risk
@@ -150,7 +175,10 @@ class CBSScheduler(Scheduler):
         return t_queue_p + t_prefill_0 + t_kv + t_ctrl + t_queue_d + t_decode_0 * o_remain
 
     def _compute_coloc_cost(self, req: 'Request', d_worker: 'CBSWorker') -> float:
-        """C_coloc = T_queue_d + T_prefill_0*(1+a_p) + T_decode_0*(1+a_d)*o_remain + ext + dispatch"""
+        """
+        C_coloc = T_queue_d + ΔT_prefill + λ·Δ_ext + Δ_dispatch
+        where ΔT_prefill = α_p · T_prefill_0 (plus the baseline T_prefill_0 for symmetry with C_disagg)
+        """
         decode_bs = len(d_worker.decode_queue) + d_worker._decode_ips
 
         # Queue wait at this decode worker
@@ -160,11 +188,8 @@ class CBSScheduler(Scheduler):
         alpha_p = self.interference_model.get_alpha_p(
             decode_bs=decode_bs, prefill_len=req.prefill_lens, model_type=d_worker.model_type,
         )
-        alpha_d = self.interference_model.get_alpha_d(
-            decode_bs=decode_bs, prefill_len=req.prefill_lens, model_type=d_worker.model_type,
-        )
 
-        # Prefill time with interference
+        # Prefill time (baseline)
         t_prefill_0 = get_prefill_time(
             num_tokens=req.prefill_lens, bs=1, decode_bs=0,
             pp=self.cluster.PP_decode,
@@ -173,7 +198,7 @@ class CBSScheduler(Scheduler):
             engine_type=d_worker.engine_type,
         )
 
-        # Decode step time with interference
+        # Decode step time (baseline)
         o_remain = req.output_lens
         t_decode_0 = get_decode_time(
             num_requests=max(decode_bs, 1),
@@ -183,13 +208,28 @@ class CBSScheduler(Scheduler):
             engine_type=d_worker.engine_type,
         )
 
-        # Externality: prefill blocks decode for existing requests
-        delta_ext = t_prefill_0 * decode_bs if decode_bs > 0 else 0
+        # Coloc prefill duration τ_j = T_prefill_0 * (1 + α_p)
+        tau_j = t_prefill_0 * (1 + alpha_p)
 
-        # Dispatch contention
-        delta_dispatch = self.kappa_dispatch * (
-            t_prefill_0 + t_decode_0 * o_remain
+        # Δ_ext: per-request externality with ω_u weighting (chap4 eq 4.11-4.12)
+        delta_ext = 0.0
+        if d_worker.decode_queue:
+            avg_output = sum(r.output_lens for r in d_worker.decode_queue) / len(d_worker.decode_queue)
+            for u in d_worker.decode_queue:
+                alpha_d_u = self.interference_model.get_alpha_d(
+                    decode_bs=decode_bs, prefill_len=req.prefill_lens, model_type=d_worker.model_type,
+                )
+                # ω_u = η1 + η2 * (o_remain_u / avg_o) + η3 * (TPOT_u / SLO_TPOT)
+                o_remain_u = max(u.output_lens - max(0, u.counter), 1)
+                tpot_u_ratio = self._estimate_single_tpot(u, d_worker) / self.slo_tpot if self.slo_tpot > 0 else 0
+                omega_u = 0.5 + 0.3 * (o_remain_u / max(avg_output, 1)) + 0.2 * tpot_u_ratio
+                delta_ext += omega_u * tau_j * alpha_d_u
+
+        # Δ_dispatch: simplified (no g_launch in simulator)
+        alpha_d = self.interference_model.get_alpha_d(
+            decode_bs=decode_bs, prefill_len=req.prefill_lens, model_type=d_worker.model_type,
         )
+        delta_dispatch = self.kappa_dispatch * tau_j
 
         return (
             t_queue_d
@@ -200,13 +240,65 @@ class CBSScheduler(Scheduler):
         )
 
     def _compute_risk(self, req: 'Request', d_worker: 'CBSWorker') -> float:
-        """SLO violation risk: higher when decode worker is heavily loaded."""
+        """
+        Δ_risk = γ1 · max(0, TTFT_coloc - SLO_TTFT) + γ2 · Σ max(0, TPOT_u_coloc - SLO_TPOT)
+        (chap4 eq 4.16)
+        """
         decode_bs = len(d_worker.decode_queue) + d_worker._decode_ips
-        capacity = d_worker.decode_max_batch_size
-        if capacity <= 0:
+        alpha_p = self.interference_model.get_alpha_p(
+            decode_bs=decode_bs, prefill_len=req.prefill_lens, model_type=d_worker.model_type,
+        )
+
+        # Predicted TTFT under colocation
+        t_queue_d = self._estimate_decode_queue_wait(d_worker)
+        t_prefill_0 = get_prefill_time(
+            num_tokens=req.prefill_lens, bs=1, decode_bs=0,
+            pp=self.cluster.PP_decode,
+            model_type=d_worker.model_type, TP=d_worker.TP_Prefill,
+            prefill_len_list=[req.prefill_lens],
+            engine_type=d_worker.engine_type,
+        )
+        ttft_coloc = t_queue_d + t_prefill_0 * (1 + alpha_p)
+        gamma1 = 1.0
+        risk_ttft = gamma1 * max(0.0, ttft_coloc - self.slo_ttft)
+
+        # Predicted TPOT for each existing decode request after colocation
+        gamma2 = 1.0
+        risk_tpot = 0.0
+        for u in d_worker.decode_queue:
+            tpot_u = self._estimate_single_tpot_with_coloc(u, d_worker, req)
+            risk_tpot += max(0.0, tpot_u - self.slo_tpot)
+        risk_tpot *= gamma2
+
+        return risk_ttft + risk_tpot
+
+    def _estimate_single_tpot(self, u: 'Request', worker: 'CBSWorker') -> float:
+        """Estimate TPOT for a single request u on worker (current state)."""
+        decode_bs = len(worker.decode_queue) + worker._decode_ips
+        if decode_bs == 0:
             return 0
-        load_ratio = decode_bs / capacity
-        return load_ratio * req.output_lens * 0.01
+        return get_decode_time(
+            num_requests=decode_bs,
+            pp=self.cluster.PP_decode,
+            model_type=worker.model_type, TP=worker.TP_Decode,
+            token_generated_list=[u.current_context_len + 1],
+            engine_type=worker.engine_type,
+        )
+
+    def _estimate_single_tpot_with_coloc(self, u: 'Request', worker: 'CBSWorker', new_req: 'Request') -> float:
+        """Estimate TPOT for request u if new_req is colocated on the same worker."""
+        decode_bs = len(worker.decode_queue) + worker._decode_ips
+        alpha_d = self.interference_model.get_alpha_d(
+            decode_bs=decode_bs, prefill_len=new_req.prefill_lens, model_type=worker.model_type,
+        )
+        t_step_0 = get_decode_time(
+            num_requests=max(decode_bs, 1),
+            pp=self.cluster.PP_decode,
+            model_type=worker.model_type, TP=worker.TP_Decode,
+            token_generated_list=[u.current_context_len + 1],
+            engine_type=worker.engine_type,
+        )
+        return t_step_0 * (1 + alpha_d)
 
     # ---- Queue wait estimation ----
 
@@ -252,10 +344,13 @@ class CBSScheduler(Scheduler):
                 return  # All done, stop migration process
             if not self.enable_migration:
                 continue
+            # Shared migration budget per scan (chap4: mitigation + consolidation share R_max)
+            self._scan_migrations = 0
             self._do_mitigation()
             self._do_consolidation()
+            # Switch-back check runs every scan (independent of consolidation)
             if self.enable_role_adaptation:
-                self._do_role_adaptation()
+                self._try_recover_to_decode()
 
     def _estimate_tpot(self, worker: 'CBSWorker') -> float:
         """Estimate per-token output time for requests on this worker."""
@@ -273,90 +368,131 @@ class CBSScheduler(Scheduler):
         return t_step
 
     def _violation_prob(self, worker: 'CBSWorker') -> float:
-        """Approximate SLO violation probability based on current TPOT vs SLO."""
+        """
+        P_viol ≈ 1 - Φ((SLO_TPOT / T_decode_step_0 - 1 - α_d) / σ_α)
+        (chap4 eq 4.21)
+        """
         tpot = self._estimate_tpot(worker)
-        if self.slo_tpot <= 0:
+        if self.slo_tpot <= 0 or tpot == 0:
             return 0
-        ratio = tpot / self.slo_tpot
-        # Simple sigmoid-like mapping: ratio > 1 means likely violation
-        if ratio <= 0.5:
-            return 0.0
-        elif ratio >= 1.5:
-            return 1.0
-        else:
-            return (ratio - 0.5) / 1.0  # Linear from 0 to 1 in [0.5, 1.5]
+        # Approximate: use tpot as T_step_0 * (1 + α_d), so α_d ≈ tpot/T_step_0 - 1
+        # For the normal CDF, compute z = (SLO/tpot_baseline - 1 - alpha_hat) / sigma
+        # Simplified: z = (SLO - tpot) / (sigma * tpot)
+        z = (self.slo_tpot - tpot) / max(self.sigma_alpha * tpot, 0.001)
+        return 1.0 - 0.5 * (1.0 + math.erf(z / math.sqrt(2)))
 
     def _do_mitigation(self):
-        """Mitigation: migrate requests from overloaded decode workers to lighter ones."""
+        """
+        Mitigation (chap4 Algorithm 2, Phase 1):
+        Scan all decode nodes, find requests with P_viol > θ_ceil,
+        sort by P_viol desc (tie-break by KV size asc),
+        migrate to node with max G_mig > 0.
+        """
         now = self.env.now
-        n_migrated = 0
 
+        # Collect candidates across all overloaded workers
+        all_candidates = []
         for src_worker in self._decode_heads:
-            if n_migrated >= self.max_migrations_per_scan:
-                break
             p_viol = self._violation_prob(src_worker)
             if p_viol <= self.theta_ceil:
                 continue
+            for r in src_worker.decode_queue:
+                if self._cooldown_until.get(r.req_id, 0) <= now:
+                    kv_size = r.current_context_len
+                    all_candidates.append((r, src_worker, p_viol, kv_size))
 
-            # Find candidates to migrate (from queue tail, not in cooldown)
-            candidates = [
-                r for r in src_worker.decode_queue
-                if self._cooldown_until.get(r.req_id, 0) <= now
-            ]
-            if not candidates:
+        if not all_candidates:
+            return
+
+        # Sort: P_viol desc; if diff < 0.05, by KV size asc
+        all_candidates.sort(key=lambda x: (-x[2], x[3]))
+
+        for req, src_worker, p_viol, kv_size in all_candidates:
+            if self._scan_migrations >= self.max_migrations_per_scan:
+                break
+            if req not in src_worker.decode_queue:
                 continue
 
-            # Sort by remaining output (migrate shortest first = least KV to transfer)
-            candidates.sort(key=lambda r: r.output_lens - max(0, r.counter))
+            # Find target with max G_mig > 0
+            best_dst = None
+            best_g_mig = 0.0
+            for dst_worker in self._decode_heads:
+                if dst_worker is src_worker:
+                    continue
+                tpot_after = self._estimate_tpot_with_extra(dst_worker, 1)
+                if tpot_after > self.theta_dispatch * self.slo_tpot:
+                    continue
 
-            for req in candidates:
-                if n_migrated >= self.max_migrations_per_scan:
-                    break
+                # G_mig (chap4 eq 4.25)
+                o_remain = max(req.output_lens - max(0, req.counter), 1)
+                tpot_src_before = self._estimate_tpot(src_worker)
+                tpot_src_after = self._estimate_tpot_with_extra(src_worker, -1)
+                delta_src = max(tpot_src_before - tpot_src_after, 0)
+                kv_delay = self.kv_transfer_latency * (req.current_context_len / 512.0)
+                tpot_dst_before = self._estimate_tpot(dst_worker)
+                delta_admit = max(tpot_after - tpot_dst_before, 0)
+                g_mig = o_remain * delta_src - kv_delay - delta_admit * o_remain
 
-                # Find best destination
-                best_dst = None
-                best_tpot_after = float('inf')
-                for dst_worker in self._decode_heads:
-                    if dst_worker is src_worker:
-                        continue
-                    dst_bs = len(dst_worker.decode_queue) + dst_worker._decode_ips
-                    # Check safety: TPOT after adding this request
-                    tpot_after = self._estimate_tpot_with_extra(dst_worker, 1)
-                    if tpot_after <= self.theta_dispatch * self.slo_tpot:
-                        if tpot_after < best_tpot_after:
-                            best_tpot_after = tpot_after
-                            best_dst = dst_worker
+                if g_mig > best_g_mig:
+                    best_g_mig = g_mig
+                    best_dst = dst_worker
 
-                if best_dst is not None:
-                    # Execute migration
-                    src_worker.decode_queue.remove(req)
-                    best_dst.decode_queue.append(req)
-                    best_dst.wakeup()
-                    self._cooldown_until[req.req_id] = now + self.migration_cooldown
-                    n_migrated += 1
-                    self.n_migrations += 1
+            if best_dst is not None:
+                kv_delay = self.kv_transfer_latency * (req.current_context_len / 512.0)
+                self.env.process(self._async_migrate(req, src_worker, best_dst, kv_delay))
+                self._cooldown_until[req.req_id] = now + self.migration_cooldown
+                self._scan_migrations += 1
+                self.n_migrations += 1
+
+    def _async_migrate(self, req, src_worker, dst_worker, delay):
+        """SimPy process: async KV transfer, request stays on src during transfer."""
+        yield self.env.timeout(delay)
+        if req in src_worker.decode_queue:
+            src_worker.decode_queue.remove(req)
+            dst_worker.decode_queue.append(req)
+            dst_worker.wakeup()
 
     def _do_consolidation(self):
-        """Consolidation: merge requests from lightly-loaded decode workers."""
+        """
+        Consolidation (chap4 Algorithm 2, Phase 2):
+        Find low-load nodes (all requests TPOT < θ_floor * SLO),
+        try to bin-pack their requests to other safe nodes (argmax TPOT_after),
+        trigger role adaptation if node is fully cleared.
+        """
         now = self.env.now
-        n_migrated_total = self.n_migrations  # Track within this scan
 
-        # Find low-load workers
+        # Find low-load workers (chap4: all requests TPOT < θ_floor * SLO and has active requests)
+        # Additional stability check: only consider nodes with few requests (truly underutilized)
         low_load_workers = []
+        avg_decode_bs = sum(
+            len(w.decode_queue) + w._decode_ips for w in self._decode_heads
+        ) / max(len(self._decode_heads), 1)
+
         for w in self._decode_heads:
-            if len(w.decode_queue) + w._decode_ips == 0:
+            w_bs = len(w.decode_queue) + w._decode_ips
+            if w_bs == 0:
                 continue
-            tpot = self._estimate_tpot(w)
-            if tpot < self.theta_floor * self.slo_tpot:
+            # Must be significantly below average load to be considered low-load
+            if w_bs >= avg_decode_bs * 0.5 and avg_decode_bs > 2:
+                continue
+            all_below = True
+            for u in w.decode_queue:
+                tpot_u = self._estimate_single_tpot(u, w)
+                if tpot_u >= self.theta_floor * self.slo_tpot:
+                    all_below = False
+                    break
+            if all_below:
                 low_load_workers.append(w)
 
-        # Sort by load ascending (merge smallest first)
+        # Sort by |W_d| ascending (drain smallest first)
         low_load_workers.sort(key=lambda w: len(w.decode_queue) + w._decode_ips)
 
         for src_worker in low_load_workers:
             if len(self._decode_heads) <= 1:
                 break
-            # Try to move all requests out
+            if self._scan_migrations >= self.max_migrations_per_scan:
+                break
+
             movable = [
                 r for r in list(src_worker.decode_queue)
                 if self._cooldown_until.get(r.req_id, 0) <= now
@@ -365,19 +501,27 @@ class CBSScheduler(Scheduler):
                 continue
 
             all_placed = True
-            placements = []  # (req, dst_worker)
+            placements = []
             for req in movable:
+                if self._scan_migrations + len(placements) >= self.max_migrations_per_scan:
+                    all_placed = False
+                    break
+
+                # Find safe node with highest TPOT_after (bin-packing: fill fullest first)
                 best_dst = None
-                best_tpot = float('inf')
+                best_tpot = -1.0
                 for dst_worker in self._decode_heads:
                     if dst_worker is src_worker:
                         continue
-                    tpot_after = self._estimate_tpot_with_extra(
-                        dst_worker, 1 + sum(1 for _, d in placements if d is dst_worker)
-                    )
-                    if tpot_after <= self.theta_dispatch * self.slo_tpot and tpot_after < best_tpot:
+                    n_already = sum(1 for _, d in placements if d is dst_worker)
+                    tpot_after = self._estimate_tpot_with_extra(dst_worker, 1 + n_already)
+                    # Safety: TPOT_after ≤ θ_dispatch * SLO and memory check
+                    if tpot_after > self.theta_dispatch * self.slo_tpot:
+                        continue
+                    if tpot_after > best_tpot:
                         best_tpot = tpot_after
                         best_dst = dst_worker
+
                 if best_dst is None:
                     all_placed = False
                     break
@@ -385,16 +529,23 @@ class CBSScheduler(Scheduler):
 
             if all_placed and placements:
                 for req, dst_worker in placements:
-                    src_worker.decode_queue.remove(req)
-                    dst_worker.decode_queue.append(req)
-                    dst_worker.wakeup()
+                    kv_delay = self.kv_transfer_latency * (req.current_context_len / 512.0)
+                    self.env.process(self._async_migrate(req, src_worker, dst_worker, kv_delay))
                     self._cooldown_until[req.req_id] = now + self.migration_cooldown
+                    self._scan_migrations += 1
                     self.n_migrations += 1
 
+                # Role adaptation after consolidation clears node (chap4 Algorithm 2 line 476)
+                if self.enable_role_adaptation:
+                    max_delay = max(
+                        self.kv_transfer_latency * (r.current_context_len / 512.0) for r, _ in placements
+                    )
+                    self.env.process(self._delayed_role_check(src_worker, max_delay + 1))
+
     def _estimate_tpot_with_extra(self, worker: 'CBSWorker', extra_reqs: int) -> float:
-        """Estimate TPOT if extra_reqs more requests were added to this worker."""
+        """Estimate TPOT if extra_reqs more (or fewer, if negative) requests on this worker."""
         decode_bs = len(worker.decode_queue) + worker._decode_ips + extra_reqs
-        if decode_bs == 0:
+        if decode_bs <= 0:
             return 0
         avg_ctx = 512  # Rough estimate
         if worker.decode_queue:
@@ -408,56 +559,46 @@ class CBSScheduler(Scheduler):
         )
 
     # ---- Role Adaptation (CBS-Full) ----
+    # Triggered only after consolidation clears a node (chap4 Algorithm 2 line 476)
 
-    def _do_role_adaptation(self):
-        """Dynamic role switching with conservative guards."""
+    def _try_convert_to_prefill(self, empty_worker: 'CBSWorker'):
+        """Convert a cleared decode worker to prefill if prefill queue pressure is high."""
         n_decode_now = len(self._decode_heads)
-        n_prefill_now = len(self._prefill_heads)
+        # Guard: |P|≥1 and |D|≥1
+        if n_decode_now <= 1:
+            return
 
-        # Guard: never reduce decode workers below half of initial count
-        min_decode = max(self._initial_n_decode // 2, 1)
+        avg_queue_wait = 0
+        for w in self._prefill_heads:
+            avg_queue_wait += self._estimate_prefill_queue_wait(w)
+        avg_queue_wait /= max(len(self._prefill_heads), 1)
 
-        # ---- Decode -> Prefill ----
-        # Only when prefill queue pressure is high AND we have enough decode headroom
-        if n_decode_now > min_decode:
-            avg_queue_wait = 0
-            for w in self._prefill_heads:
-                avg_queue_wait += self._estimate_prefill_queue_wait(w)
-            avg_queue_wait /= max(n_prefill_now, 1)
+        role_thresh = 0.5 * self.slo_ttft
+        if avg_queue_wait <= role_thresh:
+            return
 
-            role_thresh = 0.5 * self.slo_ttft
+        # Convert: decode -> prefill
+        empty_worker.role = 'prefill'
+        empty_worker.should_request_stay = False
+        empty_worker.global_scheduler = self
+        self._decode_heads.remove(empty_worker)
+        self._decode_queues.remove(empty_worker.decode_queue)
+        self._prefill_heads.append(empty_worker)
+        self._prefill_queues.append(empty_worker.prefill_queue)
+        self._converted_workers.add(empty_worker.wid)
+        self.n_role_switches += 1
 
-            if avg_queue_wait > role_thresh:
-                # Also check that decode side is healthy before converting
-                avg_tpot = 0
-                n_active = 0
-                for w in self._decode_heads:
-                    if len(w.decode_queue) + w._decode_ips > 0:
-                        avg_tpot += self._estimate_tpot(w)
-                        n_active += 1
-                decode_healthy = (n_active == 0) or (avg_tpot / max(n_active, 1) < 0.5 * self.slo_tpot)
+    def _delayed_role_check(self, worker, delay):
+        """SimPy process: check role conversion after migrations complete."""
+        yield self.env.timeout(delay)
+        if len(worker.decode_queue) == 0 and worker._decode_ips == 0 and worker in self._decode_heads:
+            self._try_convert_to_prefill(worker)
 
-                if decode_healthy:
-                    for d_worker in list(self._decode_heads):
-                        if len(d_worker.decode_queue) + d_worker._decode_ips > 0:
-                            continue
-                        if n_decode_now <= min_decode:
-                            break
-                        # Switch role: decode -> prefill
-                        d_worker.role = 'prefill'
-                        d_worker.should_request_stay = False
-                        d_worker.global_scheduler = self
-                        self._decode_heads.remove(d_worker)
-                        self._decode_queues.remove(d_worker.decode_queue)
-                        self._prefill_heads.append(d_worker)
-                        self._prefill_queues.append(d_worker.prefill_queue)
-                        self._converted_workers.add(d_worker.wid)
-                        self.n_role_switches += 1
-                        n_decode_now -= 1
-                        break  # One switch per scan
+    def _try_recover_to_decode(self):
+        """Switch back: converted prefill worker -> decode when decode pressure is high."""
+        if not self._converted_workers:
+            return
 
-        # ---- Prefill -> Decode (switch back) ----
-        # When decode pressure is high, recover converted workers
         avg_tpot = 0
         n_active = 0
         for w in self._decode_heads:
@@ -467,22 +608,24 @@ class CBSScheduler(Scheduler):
         if n_active > 0:
             avg_tpot /= n_active
 
-        if avg_tpot > self.theta_dispatch * self.slo_tpot and self._converted_workers:
-            for p_worker in list(self._prefill_heads):
-                if p_worker.wid not in self._converted_workers:
-                    continue
-                if len(p_worker.prefill_queue) + p_worker._prefill_ips > 0:
-                    continue
-                if len(self._prefill_heads) <= 1:
-                    break
-                # Switch back: prefill -> decode
-                p_worker.role = 'decode'
-                p_worker.should_request_stay = True
-                p_worker.global_scheduler = None
-                self._prefill_heads.remove(p_worker)
-                self._prefill_queues.remove(p_worker.prefill_queue)
-                self._decode_heads.append(p_worker)
-                self._decode_queues.append(p_worker.decode_queue)
-                self._converted_workers.discard(p_worker.wid)
-                self.n_role_switches += 1
+        if avg_tpot <= self.theta_dispatch * self.slo_tpot:
+            return
+
+        for p_worker in list(self._prefill_heads):
+            if p_worker.wid not in self._converted_workers:
+                continue
+            if len(p_worker.prefill_queue) + p_worker._prefill_ips > 0:
+                continue
+            if len(self._prefill_heads) <= 1:
                 break
+            # Switch back: prefill -> decode
+            p_worker.role = 'decode'
+            p_worker.should_request_stay = True
+            p_worker.global_scheduler = None
+            self._prefill_heads.remove(p_worker)
+            self._prefill_queues.remove(p_worker.prefill_queue)
+            self._decode_heads.append(p_worker)
+            self._decode_queues.append(p_worker.decode_queue)
+            self._converted_workers.discard(p_worker.wid)
+            self.n_role_switches += 1
+            break
